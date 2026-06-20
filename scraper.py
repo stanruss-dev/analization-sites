@@ -26,6 +26,26 @@ import requests as req_lib
 from bs4 import BeautifulSoup
 from playwright.async_api import async_playwright
 
+try:
+    from deep_translator import GoogleTranslator
+    from langdetect import detect, LangDetectException
+    _TRANSLATE_OK = True
+except ImportError:
+    _TRANSLATE_OK = False
+
+
+def translate_ru(text: str) -> str:
+    if not _TRANSLATE_OK or not text or len(text.strip()) < 20:
+        return text
+    try:
+        sample = text[:500].strip()
+        if detect(sample) != "en":
+            return text
+        parts = [text[i:i+4500] for i in range(0, min(len(text), 27000), 4500)]
+        return " ".join(GoogleTranslator(source="en", target="ru").translate(p) or p for p in parts)
+    except Exception:
+        return text
+
 sys.stdout.reconfigure(encoding="utf-8")
 
 # ──────────────────────────────────────────────
@@ -215,13 +235,13 @@ def parse_html(url: str, html: str, conn: sqlite3.Connection, base: str) -> list
     soup = BeautifulSoup(html, "lxml")
     for t in soup(["script","style","noscript","svg"]): t.decompose()
 
-    title  = clean(soup.title.string if soup.title else "")
-    desc   = clean((soup.find("meta", attrs={"name": re.compile("^description$", re.I)}) or {}).get("content",""))
+    title  = translate_ru(clean(soup.title.string if soup.title else ""))
+    desc   = translate_ru(clean((soup.find("meta", attrs={"name": re.compile("^description$", re.I)}) or {}).get("content","")))
     kw     = clean((soup.find("meta", attrs={"name": re.compile("^keywords$", re.I)}) or {}).get("content",""))
     h1_el  = soup.find("h1")
-    h1     = clean(h1_el.get_text()) if h1_el else ""
+    h1     = translate_ru(clean(h1_el.get_text())) if h1_el else ""
     # Сохраняем чистый контент без навигации
-    raw    = _main_content(BeautifulSoup(html, "lxml"))
+    raw    = translate_ru(_main_content(BeautifulSoup(html, "lxml")))
     now    = datetime.now(timezone.utc).isoformat()
 
     conn.execute(
@@ -289,7 +309,7 @@ def _schema(data, url, conn):
     t = data.get("@type","")
 
     if t in ("Product","IndividualProduct"):
-        name = clean(data.get("name",""))
+        name = translate_ru(clean(data.get("name","")))
         if not name: return
         price, cur, old = "", "", ""
         offers = data.get("offers")
@@ -307,7 +327,7 @@ def _schema(data, url, conn):
         if isinstance(img, list): img = img[0] if img else ""
         if isinstance(img, dict): img = img.get("url","")
         sku = str(data.get("sku", data.get("productID","")))
-        desc = clean(data.get("description",""))[:400]
+        desc = translate_ru(clean(data.get("description",""))[:400])
         conn.execute(
             "INSERT OR IGNORE INTO products VALUES (NULL,?,?,?,?,?,?,?,?,?,?,?,?)",
             (url,name,price,old,cur,sku,brand,"",desc,img,"",""))
@@ -315,10 +335,10 @@ def _schema(data, url, conn):
     elif t in ("Organization","LocalBusiness","Store","Company"):
         if data.get("name"):
             conn.execute("INSERT OR REPLACE INTO company_info VALUES (?,?)",
-                         ("org_name", clean(data["name"])))
+                         ("org_name", translate_ru(clean(data["name"]))))
         if data.get("description"):
             conn.execute("INSERT OR REPLACE INTO company_info VALUES (?,?)",
-                         ("org_description", clean(data["description"])[:800]))
+                         ("org_description", translate_ru(clean(data["description"])[:800])))
         for p in ([data["telephone"]] if isinstance(data.get("telephone"),str) else data.get("telephone",[])):
             conn.execute("INSERT OR IGNORE INTO contacts VALUES (NULL,?,?,?)", (url,"phone",clean(p)))
         if data.get("email"):
@@ -433,14 +453,14 @@ def json_products(data, source_url, conn, _depth=0):
     if isinstance(data, list):
         for item in data: count += json_products(item, source_url, conn, _depth+1)
     elif isinstance(data, dict):
-        name = next((clean(data[k]) for k in NAME_K if k in data and isinstance(data[k],str) and data[k].strip()), "")
+        name = translate_ru(next((clean(data[k]) for k in NAME_K if k in data and isinstance(data[k],str) and data[k].strip()), ""))
         if name and len(name) > 1:
             price_raw = next((str(data[k]) for k in PRICE_K if k in data), "")
             price, cur = price_and_currency(price_raw) if price_raw else ("","")
             if not price and price_raw: price = price_raw
             old = next((str(data[k]) for k in ["old_price","price_old","compare_price"] if k in data), "")
             sku  = next((str(data[k]) for k in SKU_K if k in data and str(data[k]).strip()), "")
-            desc = next((clean(data[k])[:400] for k in DESC_K if k in data and isinstance(data[k],str)), "")
+            desc = translate_ru(next((clean(data[k])[:400] for k in DESC_K if k in data and isinstance(data[k],str)), ""))
             img  = next((data[k] for k in IMG_K if k in data and isinstance(data[k],str)), "")
             purl = next((data[k] for k in URL_K if k in data and isinstance(data[k],str)), "")
             brand= next((clean(data[k]) for k in BRAND_K if k in data and isinstance(data[k],str)), "")
@@ -573,6 +593,18 @@ async def crawl(start_url: str, max_pages: int = 100, workers: int = 5, wait_ms:
     log.info("▶ %s  max=%d workers=%d wait=%dms", start_url, max_pages, workers, wait_ms)
 
     conn = init_db()
+
+    # Очищаем данные предыдущего скрапа
+    conn.executescript("""
+        DELETE FROM pages;
+        DELETE FROM contacts;
+        DELETE FROM products;
+        DELETE FROM services;
+        DELETE FROM company_info;
+        DELETE FROM links;
+        DELETE FROM api_responses;
+    """)
+    conn.commit()
 
     visited: set[str] = set()
     queue: deque[str] = deque([start_url])
@@ -759,7 +791,8 @@ def print_report(output_json: str | None = None):
         print(f"\n{'='*70}")
         print(f"СОДЕРЖИМОЕ СТРАНИЦ ({len(info_pages)}):")
         for url, title, h1, raw in info_pages:
-            heading = title.replace(" - rusalut.ru", "").replace(" – rusalut.ru", "").strip() or h1 or url
+            domain_suffix = info.get("domain", "")
+            heading = re.sub(rf"\s*[-–]\s*{re.escape(domain_suffix)}\s*$", "", title or "").strip() or h1 or url
             print(f"\n--- {heading} ---")
             print(f"URL: {url}")
             if raw:
@@ -819,7 +852,9 @@ def _clean_page_text(text: str) -> str:
 
 def _save_markdown(conn: sqlite3.Connection, info: dict):
     domain = info.get("domain", "site")
-    md_path = Path(f"report_{domain}.md")
+    reports_dir = Path("reports")
+    reports_dir.mkdir(exist_ok=True)
+    md_path = reports_dir / f"report_{domain}.md"
 
     emails  = json.loads(info.get("emails", "[]"))
     phones  = list(set(json.loads(info.get("phones", "[]"))))
@@ -886,7 +921,7 @@ def _save_markdown(conn: sqlite3.Connection, info: dict):
     if info_pages:
         lines.append(f"\n## Содержимое страниц\n")
         for url, title, h1, raw in info_pages:
-            heading = (title or "").split(" - ")[0].split(" – ")[0].strip() or h1 or url
+            heading = re.sub(rf"\s*[-–]\s*{re.escape(domain)}\s*$", "", title or "").strip() or (title or "").split(" - ")[0].split(" – ")[0].strip() or h1 or url
             lines.append(f"\n### {heading}\n")
             lines.append(f"**URL:** {url}\n")
             if raw:
