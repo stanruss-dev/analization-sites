@@ -15,6 +15,7 @@ import logging
 import re
 import sqlite3
 import sys
+import time
 import xml.etree.ElementTree as ET
 from collections import deque
 from datetime import datetime, timezone
@@ -34,7 +35,8 @@ except ImportError:
     _TRANSLATE_OK = False
 
 
-def translate_ru(text: str) -> str:
+def _translate_one(text: str) -> str:
+    """Переводит одну строку EN→RU. Возвращает оригинал, если перевод не нужен/не удался."""
     if not _TRANSLATE_OK or not text or len(text.strip()) < 20:
         return text
     try:
@@ -45,6 +47,73 @@ def translate_ru(text: str) -> str:
         return " ".join(GoogleTranslator(source="en", target="ru").translate(p) or p for p in parts)
     except Exception:
         return text
+
+
+# Колонки для перевода: (таблица, ключ-колонка, текстовая-колонка)
+_TRANSLATE_COLS = [
+    ("pages",    "url",  "title"),
+    ("pages",    "url",  "description"),
+    ("pages",    "url",  "h1"),
+    ("pages",    "url",  "raw_text"),
+    ("products", "id",   "name"),
+    ("products", "id",   "description"),
+    ("services", "id",   "name"),
+    ("services", "id",   "description"),
+]
+
+
+def translate_db(conn: sqlite3.Connection, delay: float = 0.3) -> None:
+    """Пост-обработка: переводит EN→RU все собранные тексты пачкой после скрапа.
+
+    Дедуплицирует одинаковые строки (переводим один раз), делает паузу между
+    запросами к Google, чтобы не словить временный бан по IP.
+    """
+    if not _TRANSLATE_OK:
+        log.warning("Перевод пропущен: deep_translator/langdetect не установлены")
+        return
+
+    # 1. Собираем уникальные тексты из всех целевых колонок
+    uniq: set[str] = set()
+    for table, _key, col in _TRANSLATE_COLS:
+        for (val,) in conn.execute(f"SELECT DISTINCT {col} FROM {table} WHERE {col} IS NOT NULL AND {col} != ''"):
+            uniq.add(val)
+    # company_info — значения по ключам org_name/org_description
+    for (val,) in conn.execute(
+        "SELECT value FROM company_info WHERE key IN ('org_name','org_description') AND value != ''"):
+        uniq.add(val)
+
+    if not uniq:
+        return
+
+    # 2. Переводим каждую уникальную строку один раз
+    cache: dict[str, str] = {}
+    total = len(uniq)
+    log.info("Перевод: %d уникальных строк", total)
+    for i, src in enumerate(uniq, 1):
+        dst = _translate_one(src)
+        if dst != src:
+            cache[src] = dst
+            time.sleep(delay)  # пауза только после реального запроса к Google
+        if i % 25 == 0:
+            log.info("Перевод: %d/%d", i, total)
+
+    if not cache:
+        log.info("Перевод: англоязычного текста не найдено")
+        return
+
+    # 3. Пишем переводы обратно
+    for table, key, col in _TRANSLATE_COLS:
+        rows = conn.execute(
+            f"SELECT {key}, {col} FROM {table} WHERE {col} IS NOT NULL AND {col} != ''").fetchall()
+        for kval, src in rows:
+            if src in cache:
+                conn.execute(f"UPDATE {table} SET {col}=? WHERE {key}=?", (cache[src], kval))
+    for key in ("org_name", "org_description"):
+        row = conn.execute("SELECT value FROM company_info WHERE key=?", (key,)).fetchone()
+        if row and row[0] in cache:
+            conn.execute("UPDATE company_info SET value=? WHERE key=?", (cache[row[0]], key))
+    conn.commit()
+    log.info("Перевод завершён: обновлено %d уникальных строк", len(cache))
 
 sys.stdout.reconfigure(encoding="utf-8")
 
@@ -235,13 +304,13 @@ def parse_html(url: str, html: str, conn: sqlite3.Connection, base: str) -> list
     soup = BeautifulSoup(html, "lxml")
     for t in soup(["script","style","noscript","svg"]): t.decompose()
 
-    title  = translate_ru(clean(soup.title.string if soup.title else ""))
-    desc   = translate_ru(clean((soup.find("meta", attrs={"name": re.compile("^description$", re.I)}) or {}).get("content","")))
+    title  = clean(soup.title.string if soup.title else "")
+    desc   = clean((soup.find("meta", attrs={"name": re.compile("^description$", re.I)}) or {}).get("content",""))
     kw     = clean((soup.find("meta", attrs={"name": re.compile("^keywords$", re.I)}) or {}).get("content",""))
     h1_el  = soup.find("h1")
-    h1     = translate_ru(clean(h1_el.get_text())) if h1_el else ""
+    h1     = clean(h1_el.get_text()) if h1_el else ""
     # Сохраняем чистый контент без навигации
-    raw    = translate_ru(_main_content(BeautifulSoup(html, "lxml")))
+    raw    = _main_content(BeautifulSoup(html, "lxml"))
     now    = datetime.now(timezone.utc).isoformat()
 
     conn.execute(
@@ -309,7 +378,7 @@ def _schema(data, url, conn):
     t = data.get("@type","")
 
     if t in ("Product","IndividualProduct"):
-        name = translate_ru(clean(data.get("name","")))
+        name = clean(data.get("name",""))
         if not name: return
         price, cur, old = "", "", ""
         offers = data.get("offers")
@@ -327,7 +396,7 @@ def _schema(data, url, conn):
         if isinstance(img, list): img = img[0] if img else ""
         if isinstance(img, dict): img = img.get("url","")
         sku = str(data.get("sku", data.get("productID","")))
-        desc = translate_ru(clean(data.get("description",""))[:400])
+        desc = clean(data.get("description",""))[:400]
         conn.execute(
             "INSERT OR IGNORE INTO products VALUES (NULL,?,?,?,?,?,?,?,?,?,?,?,?)",
             (url,name,price,old,cur,sku,brand,"",desc,img,"",""))
@@ -335,10 +404,10 @@ def _schema(data, url, conn):
     elif t in ("Organization","LocalBusiness","Store","Company"):
         if data.get("name"):
             conn.execute("INSERT OR REPLACE INTO company_info VALUES (?,?)",
-                         ("org_name", translate_ru(clean(data["name"]))))
+                         ("org_name", clean(data["name"])))
         if data.get("description"):
             conn.execute("INSERT OR REPLACE INTO company_info VALUES (?,?)",
-                         ("org_description", translate_ru(clean(data["description"])[:800])))
+                         ("org_description", clean(data["description"])[:800]))
         for p in ([data["telephone"]] if isinstance(data.get("telephone"),str) else data.get("telephone",[])):
             conn.execute("INSERT OR IGNORE INTO contacts VALUES (NULL,?,?,?)", (url,"phone",clean(p)))
         if data.get("email"):
@@ -453,14 +522,14 @@ def json_products(data, source_url, conn, _depth=0):
     if isinstance(data, list):
         for item in data: count += json_products(item, source_url, conn, _depth+1)
     elif isinstance(data, dict):
-        name = translate_ru(next((clean(data[k]) for k in NAME_K if k in data and isinstance(data[k],str) and data[k].strip()), ""))
+        name = next((clean(data[k]) for k in NAME_K if k in data and isinstance(data[k],str) and data[k].strip()), "")
         if name and len(name) > 1:
             price_raw = next((str(data[k]) for k in PRICE_K if k in data), "")
             price, cur = price_and_currency(price_raw) if price_raw else ("","")
             if not price and price_raw: price = price_raw
             old = next((str(data[k]) for k in ["old_price","price_old","compare_price"] if k in data), "")
             sku  = next((str(data[k]) for k in SKU_K if k in data and str(data[k]).strip()), "")
-            desc = translate_ru(next((clean(data[k])[:400] for k in DESC_K if k in data and isinstance(data[k],str)), ""))
+            desc = next((clean(data[k])[:400] for k in DESC_K if k in data and isinstance(data[k],str)), "")
             img  = next((data[k] for k in IMG_K if k in data and isinstance(data[k],str)), "")
             purl = next((data[k] for k in URL_K if k in data and isinstance(data[k],str)), "")
             brand= next((clean(data[k]) for k in BRAND_K if k in data and isinstance(data[k],str)), "")
@@ -695,6 +764,8 @@ async def crawl(start_url: str, max_pages: int = 100, workers: int = 5, wait_ms:
 
         await browser.close()
 
+    # Перевод EN→RU отдельной фазой (браузер закрыт, краулинг не тормозит)
+    translate_db(conn)
     _company_info(conn, start_url)
     conn.close()
     log.info("✓ Готово. Страниц: %d", done)
